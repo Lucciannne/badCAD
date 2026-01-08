@@ -1,9 +1,12 @@
 #include "part_editor.h"
 #include "application.h"
+#include "file_dialog.h"
 #include "../core/document.h"
 #include "../render/occ_viewer.h"
 #include <imgui.h>
 #include <iostream>
+#include <fstream>
+#include <algorithm>
 #include <GLFW/glfw3.h>
 
 #ifdef _WIN32
@@ -18,7 +21,6 @@ PartEditor::PartEditor(Application* app)
     , m_document(std::make_unique<Document>())
     , m_viewer(nullptr)  // Lazy initialization when viewport is first rendered
 {
-    std::cout << "Part Editor created with document:\n" << m_document->serialize() << std::endl;
 }
 
 PartEditor::~PartEditor() {
@@ -27,19 +29,51 @@ PartEditor::~PartEditor() {
 void PartEditor::render() {
     ImGuiIO& io = ImGui::GetIO();
     
+    // Handle keyboard shortcuts
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+        if (io.KeyShift) {
+            // Ctrl+Shift+S = Save As
+            saveFileAs();
+        } else {
+            // Ctrl+S = Save
+            if (m_currentFilePath.empty()) {
+                saveFileAs();
+            } else {
+                saveFile(m_currentFilePath);
+            }
+        }
+    }
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) {
+        // Ctrl+O = Open
+        openFile();
+    }
+    
     // Top toolbar
     if (ImGui::BeginMainMenuBar()) {
         // File menu
         if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("New Part", "Ctrl+N")) {
+                newPart();
+            }
+            if (ImGui::MenuItem("New Assembly")) {
+                // TODO: Implement assembly editor
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S")) {
-                std::cout << "Save clicked" << std::endl;
+                if (m_currentFilePath.empty()) {
+                    saveFileAs();
+                } else {
+                    saveFile(m_currentFilePath);
+                }
             }
             if (ImGui::MenuItem("Save As...")) {
-                std::cout << "Save As clicked" << std::endl;
+                saveFileAs();
+            }
+            if (ImGui::MenuItem("Open", "Ctrl+O")) {
+                openFile();
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Close", "Ctrl+W")) {
-                std::cout << "Close clicked" << std::endl;
                 m_app->setState(AppState::Home);
             }
             ImGui::EndMenu();
@@ -159,10 +193,26 @@ void PartEditor::render() {
     
     ImGui::Text("Mode: %s", m_mode == PartEditorMode::Model ? "Model" : 
                             m_mode == PartEditorMode::Sketch ? "Sketch" : "Inspect");
-    ImGui::SameLine(io.DisplaySize.x - 200);
-    ImGui::Text("Ready");
+    
+    // Update and display status message
+    if (m_statusMessageTime > 0.0f) {
+        m_statusMessageTime -= io.DeltaTime;
+        if (m_statusMessageTime < 0.0f) {
+            m_statusMessage = "Ready";
+        }
+    }
+    
+    ImGui::SameLine(io.DisplaySize.x - 600);
+    if (m_statusMessageTime > 0.0f && m_statusMessage != "Ready") {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", m_statusMessage.c_str());
+    } else {
+        ImGui::Text("%s", m_statusMessage.c_str());
+    }
     
     ImGui::End();
+    
+    // Render save prompt modal if needed
+    promptSaveChanges();
 }
 
 bool PartEditor::iconButton(const char* icon, const char* tooltip, const char* svgPath) {
@@ -182,129 +232,183 @@ bool PartEditor::iconButton(const char* icon, const char* tooltip, const char* s
 
 void PartEditor::renderModelToolbar() {
     // Model mode tools
-    if (iconButton("✏️", "New Sketch", "resources/icons/new_sketch.svg")) {
-        std::cout << "New Sketch clicked" << std::endl;
-        setMode(PartEditorMode::Sketch);
+    ImGui::PushID("newsketch");
+    if (iconButton("X", "New Sketch", "resources/icons/new_sketch.svg")) {
+        std::string selectedPlane = m_document->getSelectedPlane();
+        if (!selectedPlane.empty()) {
+            // Create new sketch on selected plane
+            m_document->createSketch(selectedPlane);
+            m_hasUnsavedChanges = true;
+            // Animate camera to be orthogonal to selected plane
+            if (m_viewer) {
+                m_viewer->animateToPlane(selectedPlane);
+            }
+            setMode(PartEditorMode::Sketch);
+            m_statusMessage = "Sketch started on " + selectedPlane;
+            m_statusMessageTime = 3.0f;
+        } else {
+            m_statusMessage = "Please select a plane first (click on XY, XZ, or YZ plane)";
+            m_statusMessageTime = 5.0f;
+        }
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("⬆️", "Extrude", "resources/icons/extrude.svg")) {
-        std::cout << "Extrude clicked" << std::endl;
+    ImGui::PushID("extrude");
+    if (iconButton("X", "Extrude", "resources/icons/extrude.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("🔄", "Revolve", "resources/icons/revolve.svg")) {
-        std::cout << "Revolve clicked" << std::endl;
+    ImGui::PushID("revolve");
+    if (iconButton("X", "Revolve", "resources/icons/revolve.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("🔀", "Sweep", "resources/icons/sweep.svg")) {
-        std::cout << "Sweep clicked" << std::endl;
+    ImGui::PushID("sweep");
+    if (iconButton("X", "Sweep", "resources/icons/sweep.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("📐", "Loft", "resources/icons/loft.svg")) {
-        std::cout << "Loft clicked" << std::endl;
+    ImGui::PushID("loft");
+    if (iconButton("X", "Loft", "resources/icons/loft.svg")) {
     }
-    ImGui::SameLine();
-    ImGui::Separator();
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("➕", "Boolean Union", "resources/icons/bool_union.svg")) {
-        std::cout << "Boolean Union clicked" << std::endl;
+    ImGui::PushID("boolean");
+    if (iconButton("X", "Boolean", "resources/icons/boolean.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("➖", "Boolean Cut", "resources/icons/bool_cut.svg")) {
-        std::cout << "Boolean Cut clicked" << std::endl;
+    ImGui::PushID("fillet");
+    if (iconButton("X", "Fillet", "resources/icons/fillet.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("✂️", "Boolean Intersect", "resources/icons/bool_intersect.svg")) {
-        std::cout << "Boolean Intersect clicked" << std::endl;
+    ImGui::PushID("chamfer");
+    if (iconButton("X", "Chamfer", "resources/icons/chamfer.svg")) {
     }
-    ImGui::SameLine();
-    ImGui::Separator();
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("🟢", "Fillet", "resources/icons/fillet.svg")) {
-        std::cout << "Fillet clicked" << std::endl;
+    ImGui::PushID("shell");
+    if (iconButton("X", "Shell", "resources/icons/shell.svg")) {
     }
-    ImGui::SameLine();
-    
-    if (iconButton("📐", "Chamfer", "resources/icons/chamfer.svg")) {
-        std::cout << "Chamfer clicked" << std::endl;
-    }
-    ImGui::SameLine();
-    
-    if (iconButton("🔲", "Shell", "resources/icons/shell.svg")) {
-        std::cout << "Shell clicked" << std::endl;
-    }
+    ImGui::PopID();
 }
 
 void PartEditor::renderSketchToolbar() {
     // Drawing tools
-    if (iconButton("📏", "Line", "resources/icons/line.svg")) {
-        std::cout << "Line tool clicked" << std::endl;
+    ImGui::PushID("point");
+    bool isPointActive = (m_activeTool == SketchTool::Point);
+    if (isPointActive) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
     }
-    ImGui::SameLine();
+    if (iconButton("X", "Point", "resources/icons/point.svg")) {
+        m_activeTool = SketchTool::Point;
+        m_lineStartPointIndex = -1;  // Reset line drawing state
+        m_statusMessage = "Point tool active - Click to place points";
+        m_statusMessageTime = 3.0f;
+    }
+    if (isPointActive) {
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("⌒", "Arc", "resources/icons/arc.svg")) {
-        std::cout << "Arc tool clicked" << std::endl;
+    ImGui::PushID("line");
+    bool isLineActive = (m_activeTool == SketchTool::Line);
+    if (isLineActive) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
     }
-    ImGui::SameLine();
+    if (iconButton("X", "Line", "resources/icons/line.svg")) {
+        m_activeTool = SketchTool::Line;
+        m_lineStartPointIndex = -1;  // Reset line drawing state
+        m_statusMessage = "Line tool active - Click to start line";
+        m_statusMessageTime = 3.0f;
+    }
+    if (isLineActive) {
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("⭕", "Circle", "resources/icons/circle.svg")) {
-        std::cout << "Circle tool clicked" << std::endl;
+    ImGui::PushID("arc");
+    if (iconButton("X", "Arc", "resources/icons/arc.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("▭", "Rectangle", "resources/icons/rectangle.svg")) {
-        std::cout << "Rectangle tool clicked" << std::endl;
+    ImGui::PushID("circle");
+    if (iconButton("X", "Circle", "resources/icons/circle.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("〜", "Spline", "resources/icons/spline.svg")) {
-        std::cout << "Spline tool clicked" << std::endl;
+    ImGui::PushID("rect");
+    if (iconButton("X", "Rectangle", "resources/icons/rectangle.svg")) {
     }
-    ImGui::SameLine();
-    ImGui::Separator();
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
+    
+    ImGui::PushID("spline");
+    if (iconButton("X", "Spline", "resources/icons/spline.svg")) {
+    }
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
     // Constraint tools
-    if (iconButton("⊙", "Coincident", "resources/icons/coincident.svg")) {
-        std::cout << "Coincident constraint clicked" << std::endl;
+    ImGui::PushID("coincident");
+    if (iconButton("X", "Coincident", "resources/icons/coincident.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("⟂", "Tangent", "resources/icons/tangent.svg")) {
-        std::cout << "Tangent constraint clicked" << std::endl;
+    ImGui::PushID("tangent");
+    if (iconButton("X", "Tangent", "resources/icons/tangent.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("⊥", "Perpendicular", "resources/icons/perpendicular.svg")) {
-        std::cout << "Perpendicular constraint clicked" << std::endl;
+    ImGui::PushID("perp");
+    if (iconButton("X", "Perpendicular", "resources/icons/perpendicular.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("∥", "Parallel", "resources/icons/parallel.svg")) {
-        std::cout << "Parallel constraint clicked" << std::endl;
+    ImGui::PushID("parallel");
+    if (iconButton("X", "Parallel", "resources/icons/parallel.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     
-    if (iconButton("📐", "Dimension", "resources/icons/dimension.svg")) {
-        std::cout << "Dimension tool clicked" << std::endl;
+    ImGui::PushID("dimension");
+    if (iconButton("X", "Dimension", "resources/icons/dimension.svg")) {
     }
-    ImGui::SameLine();
+    ImGui::PopID();
+    ImGui::SameLine(0, 4);
     ImGui::Separator();
-    ImGui::SameLine();
-    
-    // Exit sketch with different styling
+    ImGui::SameLine(0, 4);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.3f, 1.0f));
-    if (iconButton("✓", "Exit Sketch", "resources/icons/exit_sketch.svg")) {
-        std::cout << "Exit Sketch clicked" << std::endl;
+    ImGui::PushID("exit");
+    if (iconButton("X", "Exit Sketch", "resources/icons/exit_sketch.svg")) {
+        // Clear editing flag on active sketch
+        auto* activeSketch = m_document->getActiveSketch();
+        if (activeSketch) {
+            activeSketch->isEditing = false;
+        }
         setMode(PartEditorMode::Model);
+        m_activeTool = SketchTool::None;
+        m_lineStartPointIndex = -1;  // Reset line drawing state
+        m_statusMessage = "Exited sketch mode";
+        m_statusMessageTime = 2.0f;
     }
+    ImGui::PopID();
     ImGui::PopStyleColor();
 }
 
@@ -332,11 +436,9 @@ void PartEditor::renderViewToolbar() {
     ImGui::Spacing();
     ImGui::SameLine();
     if (ImGui::Button("Wireframe")) {
-        std::cout << "Wireframe mode clicked" << std::endl;
     }
     ImGui::SameLine();
     if (ImGui::Button("Shaded")) {
-        std::cout << "Shaded mode clicked" << std::endl;
     }
 }
 
@@ -348,8 +450,9 @@ void PartEditor::renderFeatureTree() {
     if (ImGui::TreeNodeEx("Construction Planes", ImGuiTreeNodeFlags_DefaultOpen)) {
         const auto& planes = m_document->getPlanes();
         
+        int planeIndex = 0;
         for (const auto& plane : planes) {
-            ImGui::PushID(plane.name.c_str());
+            ImGui::PushID(planeIndex++);
             
             // Eye icon button for visibility toggle
             const char* eyeIcon = plane.visible ? "👁" : "⚫";
@@ -376,7 +479,38 @@ void PartEditor::renderFeatureTree() {
     }
     
     if (ImGui::TreeNode("Sketches")) {
-        ImGui::TextDisabled("(No sketches)");
+        const auto& sketches = m_document->getSketches();
+        if (sketches.empty()) {
+            ImGui::TextDisabled("(No sketches)");
+        } else {
+            for (const auto& sketch : sketches) {
+                std::string displayName = sketch.name;
+                if (sketch.isEditing) {
+                    displayName += " (editing)";
+                }
+                displayName += " - " + std::to_string(sketch.points.size()) + " point(s)";
+                
+                // Make selectable with double-click to edit
+                if (ImGui::Selectable(displayName.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        // Double-click to edit sketch
+                        // First, clear editing flag on all sketches
+                        for (auto& s : m_document->getSketches()) {
+                            const_cast<Document::Sketch&>(s).isEditing = false;
+                        }
+                        // Set this sketch as editing
+                        const_cast<Document::Sketch&>(sketch).isEditing = true;
+                        // Animate camera to the sketch's plane
+                        if (m_viewer) {
+                            m_viewer->animateToPlane(sketch.plane);
+                        }
+                        setMode(PartEditorMode::Sketch);
+                        m_statusMessage = "Editing sketch: " + sketch.name;
+                        m_statusMessageTime = 3.0f;
+                    }
+                }
+            }
+        }
         ImGui::TreePop();
     }
     
@@ -399,7 +533,6 @@ void PartEditor::renderViewport() {
         // Debug: Check what texture ID ImGui is using for fonts
         ImGuiIO& io = ImGui::GetIO();
         ImTextureID fontTexId = io.Fonts->TexID;
-        std::cout << "ImGui font atlas texture ID: " << (intptr_t)fontTexId << std::endl;
         
         m_viewer = std::make_unique<OccViewer>();
         
@@ -408,7 +541,6 @@ void PartEditor::renderViewport() {
         
         if (m_viewer->init(hwnd, (int)viewportSize.x, (int)viewportSize.y)) {
             m_viewer->setDocument(m_document.get());
-            std::cout << "OpenCASCADE viewer initialized in viewport" << std::endl;
         } else {
             std::cerr << "Failed to initialize OpenCASCADE viewer" << std::endl;
             m_viewer.reset();
@@ -419,6 +551,10 @@ void PartEditor::renderViewport() {
     // Update viewer size if changed (with threshold to avoid constant recreation)
     static ImVec2 lastSize(0, 0);
     if (m_viewer) {
+        // Update camera animation
+        ImGuiIO& io = ImGui::GetIO();
+        m_viewer->updateCameraAnimation(io.DeltaTime);
+        
         // Only resize if the change is significant (more than 10 pixels)
         float deltaX = std::abs(viewportSize.x - lastSize.x);
         float deltaY = std::abs(viewportSize.y - lastSize.y);
@@ -430,6 +566,14 @@ void PartEditor::renderViewport() {
     
     // Render OpenCASCADE scene to FBO
     if (m_viewer) {
+        // Update preview state for sketch tools
+        if (m_mode == PartEditorMode::Sketch && m_activeTool == SketchTool::Line) {
+            m_viewer->setPreviewState(m_lineStartPointIndex, m_hasMousePreview, 
+                                     m_previewX, m_previewY, m_isSnapped, m_snappedX, m_snappedY);
+        } else {
+            m_viewer->setPreviewState(-1, false, 0, 0, false, 0, 0);
+        }
+        
         m_viewer->render();
         
         // Display the FBO texture in ImGui
@@ -437,7 +581,6 @@ void PartEditor::renderViewport() {
         if (texId != 0) {
             static unsigned int lastTexId = 0;
             if (texId != lastTexId) {
-                std::cout << "Displaying texture ID: " << texId << std::endl;
                 lastTexId = texId;
             }
             ImGui::Image((ImTextureID)(intptr_t)texId, viewportSize, ImVec2(0, 1), ImVec2(1, 0));
@@ -455,28 +598,27 @@ void PartEditor::renderViewport() {
                 m_viewer->setHoveredPlane(hoveredPlane);
                 
                 // Middle mouse button - orbit
-                if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) && !io.KeyShift) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) && !io.KeyShift) {
                     static bool rotationStarted = false;
-                    if (!rotationStarted) {
+                    if (!rotationStarted || ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
                         m_viewer->startRotation(localX, localY);
                         rotationStarted = true;
-                    } else {
-                        m_viewer->rotation(localX, localY);
                     }
+                    m_viewer->rotation(localX, localY);
+                    
                     if (ImGui::IsMouseReleased(ImGuiMouseButton_Middle)) {
                         rotationStarted = false;
                     }
                 }
                 
                 // Shift + Middle mouse button - pan
-                if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) && io.KeyShift) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) && io.KeyShift) {
                     static bool panStarted = false;
-                    if (!panStarted) {
+                    if (!panStarted || ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
                         m_viewer->startPan(localX, localY);
                         panStarted = true;
-                    } else {
-                        m_viewer->pan(localX, localY);
                     }
+                    m_viewer->pan(localX, localY);
                     if (ImGui::IsMouseReleased(ImGuiMouseButton_Middle)) {
                         panStarted = false;
                     }
@@ -488,23 +630,127 @@ void PartEditor::renderViewport() {
                     m_viewer->zoom(wheel);
                 }
                 
+                // Update mouse preview for sketch tools
+                if (m_mode == PartEditorMode::Sketch && (m_activeTool == SketchTool::Line || m_activeTool == SketchTool::Point)) {
+                    auto* activeSketch = m_document->getActiveSketch();
+                    if (activeSketch && m_viewer) {
+                        float x, y;
+                        if (m_viewer->screenToPlanePoint((int)localX, (int)localY, 
+                                                        (int)viewportSize.x, (int)viewportSize.y,
+                                                        activeSketch->plane, x, y)) {
+                            m_previewX = x;
+                            m_previewY = y;
+                            m_hasMousePreview = true;
+                            
+                            // Try snapping to existing points first
+                            int snapPointIdx = -1;
+                            const float snapRadius = 0.05f;  // 50mm snap radius
+                            
+                            m_isSnapped = m_document->snapToPoint(activeSketch, x, y, snapRadius, 
+                                                                 m_snappedX, m_snappedY, snapPointIdx);
+                            
+                            if (m_isSnapped) {
+                                m_snappedPointIndex = snapPointIdx;
+                                m_snappedLineIndex = -1;
+                            } else {
+                                // If no point snap, try snapping to lines
+                                int snapLineIdx = -1;
+                                m_isSnapped = m_document->snapToLine(activeSketch, x, y, snapRadius, 
+                                                                    m_snappedX, m_snappedY, snapLineIdx);
+                                if (m_isSnapped) {
+                                    m_snappedPointIndex = -1;
+                                    m_snappedLineIndex = snapLineIdx;
+                                } else {
+                                    m_snappedPointIndex = -1;
+                                    m_snappedLineIndex = -1;
+                                }
+                            }
+                        } else {
+                            m_hasMousePreview = false;
+                        }
+                    }
+                } else {
+                    m_hasMousePreview = false;
+                }
+                
                 // Left mouse button - selection using ray casting
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                    std::string clickedPlane = m_viewer->pickPlane(localX, localY, (int)viewportSize.x, (int)viewportSize.y);
-                    
-                    if (!clickedPlane.empty()) {
-                        // Clicked on a plane
-                        m_document->selectPlane(clickedPlane, io.KeyCtrl);
+                    if (m_mode == PartEditorMode::Sketch && m_activeTool == SketchTool::Point) {
+                        // In sketch mode with point tool: place a point
+                        auto* activeSketch = m_document->getActiveSketch();
+                        if (activeSketch && m_viewer) {
+                            // Use snapped position if available, otherwise use raw mouse position
+                            float x = m_isSnapped ? m_snappedX : m_previewX;
+                            float y = m_isSnapped ? m_snappedY : m_previewY;
+                            
+                            m_document->addPointToSketch(activeSketch, x, y);
+                            m_hasUnsavedChanges = true;
+                        }
+                    } else if (m_mode == PartEditorMode::Sketch && m_activeTool == SketchTool::Line) {
+                        // In sketch mode with line tool: create line between two points
+                        auto* activeSketch = m_document->getActiveSketch();
+                        if (activeSketch && m_viewer) {
+                            // Use snapped position if available
+                            float x = m_isSnapped ? m_snappedX : m_previewX;
+                            float y = m_isSnapped ? m_snappedY : m_previewY;
+                            
+                            // Add point (or reuse existing nearby point)
+                            int pointIdx = m_document->addPointToSketch(activeSketch, x, y, false);
+                            
+                            if (m_lineStartPointIndex == -1) {
+                                // First click - start the line
+                                m_lineStartPointIndex = pointIdx;
+                            } else {
+                                // Check if this would close a shape
+                                bool wouldClose = false;
+                                if (m_snappedLineIndex != -1) {
+                                    // Snapping to a line - check if that line connects back to start
+                                    wouldClose = m_document->wouldCloseShapeOnLine(activeSketch, m_lineStartPointIndex, m_snappedLineIndex);
+                                } else {
+                                    // Snapping to a point or free click - check direct reachability
+                                    wouldClose = m_document->wouldCloseShape(activeSketch, m_lineStartPointIndex, pointIdx);
+                                }
+                                
+                                // Second click - complete the line
+                                if (pointIdx != m_lineStartPointIndex) {
+                                    // If we snapped to a line, split it at the snap point
+                                    if (m_snappedLineIndex != -1) {
+                                        m_document->splitLineAtPoint(activeSketch, m_snappedLineIndex, pointIdx);
+                                    }
+                                    
+                                    m_document->addLineToSketch(activeSketch, m_lineStartPointIndex, pointIdx, false);
+                                    m_hasUnsavedChanges = true;
+                                }
+                                
+                                // If we closed a shape, reset line drawing; otherwise continue chain
+                                if (wouldClose) {
+                                    m_lineStartPointIndex = -1;
+                                } else {
+                                    m_lineStartPointIndex = pointIdx;
+                                }
+                            }
+                        }
                     } else {
-                        // Clicked on empty space, deselect all unless holding Ctrl
-                        if (!io.KeyCtrl) {
-                            m_document->deselectAll();
+                        // Normal selection mode
+                        std::string clickedPlane = m_viewer->pickPlane(localX, localY, (int)viewportSize.x, (int)viewportSize.y);
+                        
+                        if (!clickedPlane.empty()) {
+                            // Clicked on a plane
+                            m_document->selectPlane(clickedPlane, io.KeyCtrl);
+                            m_statusMessage = "Selected " + clickedPlane + " (Click 'New Sketch' to start)";
+                            m_statusMessageTime = 4.0f;
+                        } else {
+                            // Clicked on empty space, deselect all unless holding Ctrl
+                            if (!io.KeyCtrl) {
+                                m_document->deselectAll();
+                            }
                         }
                     }
                 }
             } else {
                 // Mouse not over viewport, clear hover state
                 m_viewer->setHoveredPlane("");
+                m_hasMousePreview = false;
             }
             
             // Overlay info text
@@ -543,6 +789,169 @@ void PartEditor::renderConstraintsPanel() {
     ImGui::Text("Constraints");
     ImGui::Separator();
     ImGui::TextDisabled("No constraints");
+}
+
+// File operations
+std::string PartEditor::openFileDialog(bool save) {
+#ifdef _WIN32
+    HWND hwnd = nullptr;
+    if (m_app) {
+        GLFWwindow* window = m_app->getWindow();
+        if (window) {
+            hwnd = glfwGetWin32Window(window);
+        }
+    }
+    return badcad::openFileDialog(save, hwnd);
+#else
+    return "";
+#endif
+}
+
+void PartEditor::saveFile(const std::string& path) {
+    if (path.empty()) {
+        return;
+    }
+    
+    std::string data = m_document->serialize();
+    std::ofstream file(path);
+    if (file.is_open()) {
+        file << data;
+        file.close();
+        m_currentFilePath = path;
+        m_hasUnsavedChanges = false;
+        
+        // Update window title with filename
+        size_t lastSlash = path.find_last_of("/\\");
+        std::string filename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
+        m_app->setWindowTitle("badCAD - " + filename);
+        
+        m_statusMessage = "File saved: " + filename;
+        m_statusMessageTime = 3.0f;
+        
+    } else {
+        std::cerr << "Failed to save file: " << path << std::endl;
+        m_statusMessage = "ERROR: Failed to save file";
+        m_statusMessageTime = 5.0f;
+    }
+}
+
+void PartEditor::saveFileAs() {
+    std::string path = openFileDialog(true);
+    if (!path.empty()) {
+        saveFile(path);
+    }
+}
+
+void PartEditor::openFile() {
+    std::string path = openFileDialog(false);
+    if (!path.empty()) {
+        std::ifstream file(path);
+        if (file.is_open()) {
+            std::string data((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+            file.close();
+            
+            m_document->deserialize(data);
+            m_currentFilePath = path;
+            m_hasUnsavedChanges = false;
+            
+            // Refresh viewer
+            if (m_viewer) {
+                m_viewer->setDocument(m_document.get());
+                m_viewer->updateFromDocument();
+            }
+            
+            // Update window title with filename
+            size_t lastSlash = path.find_last_of("/\\");
+            std::string filename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
+            m_app->setWindowTitle("badCAD - " + filename);
+            
+            m_statusMessage = "File loaded: " + filename;
+            m_statusMessageTime = 3.0f;
+            
+        } else {
+            std::cerr << "Failed to open file: " << path << std::endl;
+            m_statusMessage = "ERROR: Failed to open file";
+            m_statusMessageTime = 5.0f;
+        }
+    }
+}
+
+void PartEditor::newPart() {
+    // Check for unsaved changes
+    if (m_hasUnsavedChanges) {
+        m_showSavePrompt = true;
+    } else {
+        resetDocument();
+    }
+}
+
+bool PartEditor::promptSaveChanges() {
+    // This will be rendered in the main render loop
+    if (!m_showSavePrompt) {
+        return false;
+    }
+    
+    bool result = false;
+    ImGui::OpenPopup("Unsaved Changes");
+    
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    
+    if (ImGui::BeginPopupModal("Unsaved Changes", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Do you want to save your changes?");
+        ImGui::Separator();
+        
+        if (ImGui::Button("Save", ImVec2(120, 0))) {
+            if (m_currentFilePath.empty()) {
+                saveFileAs();
+            } else {
+                saveFile(m_currentFilePath);
+            }
+            if (!m_hasUnsavedChanges) {  // Save was successful
+                resetDocument();
+                m_showSavePrompt = false;
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", ImVec2(120, 0))) {
+            resetDocument();
+            m_showSavePrompt = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            m_showSavePrompt = false;
+            ImGui::CloseCurrentPopup();
+        }
+        
+        ImGui::EndPopup();
+        result = true;
+    }
+    
+    return result;
+}
+
+void PartEditor::resetDocument() {
+    // Create a fresh document
+    m_document = std::make_unique<Document>();
+    
+    // Reset state
+    m_currentFilePath.clear();
+    m_hasUnsavedChanges = false;
+    m_mode = PartEditorMode::Model;
+    m_activeTool = SketchTool::None;
+    m_lineStartPointIndex = -1;  // Reset line drawing state
+    
+    // Refresh viewer with new document
+    if (m_viewer) {
+        m_viewer->setDocument(m_document.get());
+    }
+    
+    // Update window title
+    m_app->setWindowTitle("badCAD - Unsaved Part");
+    
 }
 
 } // namespace badcad
